@@ -1,0 +1,169 @@
+## (Ran-)Sackgang
+
+Wir implementieren die [RANSAC-Methode](https://en.wikipedia.org/wiki/Random_sample_consensus) für lineare Modelle in einer Funktion `ransaclm` mit (mindestens) Argumenten `formula` (wie in `lm`), `data` (wie in `lm`), `error_threshold` (=$t$ im verlinkten Wikipedia-Artikel), `inlier_threshold` (=$d$ im verlinkten) und `iterations`.  
+Was für zusätzliche Argumente benötigt die Funktion? (bitte erst selbst überlegen, dann Codebeispiel weiter unten anschauen...)  
+
+Die Funktion soll eine Liste mit Einträgen `model` und `data` zurückliefern:
+
+- `model`: das gefundene beste Modell (ein `lm`-Objekt). `NULL` falls kein Modell gefunden wurde was den gegebenen thresholds entspricht.
+- `data`: die für die Suche nach `model` verwendeten Daten, im Erfolgsfall ergänzt um eine `logical`-Spalte `.consensus_set` die das gefundene beste `consensus set` für `model` definiert.
+
+--------------
+
+a) *First, understand the problem. Then, write the code.* Skizzieren Sie zunächst in Pseudo-Code wie der RANSAC Algorithmus in Einzelschritte und Sub-Funktionen zergliedert werden kann. Definieren Sie sauber was jeweils die Inputs und Outputs dieser Sub-Funktionen sein sollen. Gehen Sie hier iterativ vor -- verfeinern Sie sukzessive die grobe, abstrakte Untergliederung in immer kleinere, konkretere Teilschritte. 
+
+- Denken Sie defensiv: Was könnte schiefgehen, wie gehen Sie sinnvoll damit um? Stichworte: Untaugliche Argumente, Daten mit fehlenden Werten, Faktorvariablen, lineare Modelle mit "$p > n$", etc....
+- Denken Sie parallel: Wie können Sie diesen Algorithmus am besten (plattformunabhängig) parallelisieren? 
+(Welches Paket -- `{future.apply}`, `{furrr}` `{foreach}` + `{do??}`, `{parallel}` -- Sie für die Parallelisierung benutzen bleibt Ihnen überlassen.)
+
+
+```{r}
+ransaclm <- function(formula, data, error_threshold, inlier_threshold, seed = 2, iterations = 100) {
+  input_checks(formula, data, error_threshold, inlier_threshold, seed, iterations)
+  p <- get_number_parameters(formula, data)
+  best_model <- NULL
+  best_error <- Inf
+  best_consensus_set <- NULL
+  for (i in 1:iterations) {
+    hypothetical_inliers_ind <- subsample(data, p)
+    current_model <- lm(formula, data[hypothetical_inliers_ind])
+    consensus_set <- list()
+    for (observation in data[-hypothetical_inliers_ind]) {
+      distance <- check_distance(observation, current_model)
+      if (distance < error_threshold) {
+        append(consensus_set, observation)
+      }
+    }
+    if (length(consensus_set) > inlier_threshold) {
+      improved_model <- lm(formula, data = hypothetical_inliers_ind + consensus_set)
+      improved_model_error <- get_error(improved_model)
+      if (improved_model_error < best_error) {
+        best_model <- improved_model
+        best_error <- improved_model_error
+        best_consensus_set <- consensus_set + hypothetical_inliers_ind
+      }
+    }
+  }
+  if (!is.null(best_model)) {
+    data <- add_consensus_column(data, best_consensus_set)
+  }
+  list(model, data)
+}
+```
+
+
+
+b) Implementieren Sie Ihren Entwurf aus a).
+
+```{r}
+# Iterative method to estimate parameters of a linear model from a set of observed data that may contain outliers. Moreover the so called consensus set (a robust training set without outliers) is determined and returned with the according trained model.
+# input:
+# * formula: formula for the lm fit
+# * data: original training data
+# * error_threshold: Threshold value to determine data points that are fit well by model
+# * inlier_threshold: Number of close data points required to assert that a model fits well to data
+# * seed and iterations: optional seed and repetition arguments.
+# output: list of model and data (if successful data has a additional boolean column which indicates the consensus set)
+ransaclm <- function(formula, data, error_threshold, inlier_threshold, seed = 2, iterations = 100) {
+  input_checks(formula, data, error_threshold, inlier_threshold, seed, iterations)
+  set.seed(seed)
+  parameter_number <- get_number_parameters(formula, data)
+  best_model <- NULL
+  best_error <- Inf
+  best_consensus_set <- NULL
+  for (i in 1:iterations) {
+    # sample required starting training set without replacement (to estimate all parameters one needs at least as many observations as parameters)
+    hypothetical_inliers_ind <- sample(nrow(data), parameter_number)
+    current_model <- lm(formula, data[hypothetical_inliers_ind, ])
+    consensus_set <- list()
+    for (observation_ind in seq(dim(data)[1])[-hypothetical_inliers_ind]) {
+      distance <- get_distance(formula, data[observation_ind, , drop = FALSE], current_model)
+      if (distance < error_threshold) {
+        consensus_set <- append(consensus_set, observation_ind)
+      }
+    }
+    consensus_set <- as.vector(unlist(consensus_set))
+    if (length(consensus_set) > inlier_threshold) {
+      improved_model <- lm(formula, data = data[c(hypothetical_inliers_ind, consensus_set), ])
+      improved_model_error <- deviance(improved_model)
+      if (improved_model_error < best_error) {
+        best_model <- improved_model
+        best_error <- improved_model_error
+        best_consensus_set <- c(consensus_set, hypothetical_inliers_ind)
+      }
+    }
+  }
+  if (!is.null(best_model)) {
+    data <- add_consensus_column(data, best_consensus_set)
+  }
+  list("model" = best_model,
+       "data" = data)
+}
+
+# check the arguments
+input_checks <- function(formula, data, error_threshold, inlier_threshold, seed, iterations) {
+  checkmate::assert_formula(formula)
+  checkmate::assert_data_frame(data, min.rows = 1, min.cols = 2)
+  checkmate::assert_numeric(error_threshold, lower = 0, len = 1, any.missing = FALSE, finite = TRUE)
+  checkmate::assert_count(inlier_threshold, positive = TRUE)
+  checkmate::assert_count(seed)
+  checkmate::assert_count(iterations, positive = TRUE)
+}
+
+# fit model with first row to determine parameter number (for example right treatment of factor variables). Early exit for underdetermined models.
+get_number_parameters <- function(formula, data) {
+  parameter_number <- length(coefficients(lm(formula, data = data[1, , drop = FALSE])))
+  if (parameter_number > dim(data)[1]) {
+    stop("Number of parameters < number of observations")
+  }
+  parameter_number
+}
+
+# get the distance for the current observation which corresponds to the residual wrt the current model
+get_distance <- function(formula, observation, current_model) {
+  predicted_value <- predict.lm(current_model, observation)
+  true_value <- as.numeric(observation[as.character(formula)[2]])
+  abs(predicted_value - true_value)
+}
+
+# add logical consensus set column to original data
+add_consensus_column <- function(data, best_consensus_set) {
+  in_consensus_set <- seq(dim(data)[1]) %in% best_consensus_set
+  cbind(data, ".consensus_set" = in_consensus_set)
+}
+```
+
+
+
+c) Überprüfen Sie Ihre Implementation (auch) mit dem untenstehenden Testcode auf Korrektheit, Ihre Funktion sollte (ungefähr, da stochastischer Algorithmus!) das selbe Ergebnis produzieren.  
+Überlegen Sie sich weitere Testfälle für Komplikationen, die bei der Anwendung auf echte Daten auftauchen könnten, und überprüfen Sie Ihre Funktion damit. Schreiben Sie dafür entsprechende Tests mit den in `testthat` und `checkmate` implementierten `expect_<BLA>()`-Funktionen.
+
+**Wie immer gilt: Schreiben Sie sauber strukturierten, ausführlich kommentierten & funktionalen 
+Code ("KIS! DRY!"), der für erwartbare Fehler und ungeeignete Inputs informative Fehlermeldungen und Warnungen produziert.**
+
+-----
+
+```{r, echo = FALSE, code = readLines("topdown-ransac-def.R")}
+```
+
+#### Tooling / Testing / Diagnostics:
+
+Wir schreiben also zusätzlich 
+
+- eine Funktion die Daten aus einem linearen Modell mit klaren Outliern 
+generiert um Testdatensätze zur Überprüfung unserer Funktion zu erzeugen, sowie
+- eine Funktion die die `ransaclm`-Ergebnisse zusammenfasst und für univariate Modelle das
+Ergebnis visualisiert.
+
+Das könnte etwa so aussehen:
+```{r, ransac_test_utils, code = readLines("topdown-ransac-utils.R")}
+```
+Natürlich können Sie das obenstehende an Ihre Implementation anpassen oder sich auch ähnliche Funktionen selbst basteln.
+
+Ihre Implementation sollte dann -- in etwa -- folgendes Verhalten reproduzieren:
+```{r, ransac_example, code = readLines("topdown-ransac-example.R")}
+```
+
+Hinweis 1: Durch die Formelnotation mit "`- inlier`" bleibt -- in meiner Implementation, zumindest -- die ursprünglich angelegte `inlier`-Variable, welche die wahren *inlier* identifiziert, im Datensatz des Rückgabeobjekts erhalten so dass wir mit `validate_ransac` eine Kreuztabelle der wahren und entdeckten Inlier/Outlier erzeugen können.
+
+Hinweis 2: Es ist zu erwarten dass Parallelisierung hier -- wenn überhaupt -- nur bei recht großen Datensätzen Zeitvorteile bringt, in meiner Testimplementation sehe ich zB bei `n_obs = 100000, n_coef = 10` und 20 (!) parallelen Prozessen nur etwa eine Halbierung der Rechenzeit gegenüber einer sequentiellen Berechnung...
