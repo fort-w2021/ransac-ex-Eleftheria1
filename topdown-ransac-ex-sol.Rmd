@@ -59,13 +59,13 @@ b) Implementieren Sie Ihren Entwurf aus a).
 # Iterative method to estimate parameters of a linear model from a set of observed data that may contain outliers. Moreover the so called consensus set (a robust training set without outliers) is determined and returned with the according trained model.
 # input:
 # * formula: formula for the lm fit
-# * data: original training data
+# * data: original training data (rows with missing values will be omitted)
 # * error_threshold: Threshold value to determine data points that are fit well by model
 # * inlier_threshold: Number of close data points required to assert that a model fits well to data
 # * seed and iterations: optional seed and repetition arguments.
 # output: list of model and data (if successful data has a additional boolean column which indicates the consensus set)
 ransaclm <- function(formula, data, error_threshold, inlier_threshold, seed = 2, iterations = 100) {
-  input_checks(formula, data, error_threshold, inlier_threshold, seed, iterations)
+  data <- input_checks(formula, data, error_threshold, inlier_threshold, seed, iterations)
   set.seed(seed)
   parameter_number <- get_number_parameters(formula, data)
   best_model <- NULL
@@ -96,23 +96,35 @@ ransaclm <- function(formula, data, error_threshold, inlier_threshold, seed = 2,
   if (!is.null(best_model)) {
     data <- add_consensus_column(data, best_consensus_set)
   }
-  list("model" = best_model,
-       "data" = data)
+  list(
+    "model" = best_model,
+    "data" = data
+  )
 }
 
-# check the arguments
+# check the arguments (return data for missing values handling)
 input_checks <- function(formula, data, error_threshold, inlier_threshold, seed, iterations) {
   checkmate::assert_formula(formula)
-  checkmate::assert_data_frame(data, min.rows = 1, min.cols = 2)
+  checkmate::assert_data_frame(data, min.rows = 1, min.cols = 2, all.missing = FALSE)
   checkmate::assert_numeric(error_threshold, lower = 0, len = 1, any.missing = FALSE, finite = TRUE)
   checkmate::assert_count(inlier_threshold, positive = TRUE)
   checkmate::assert_count(seed)
   checkmate::assert_count(iterations, positive = TRUE)
+  # deal with missing data
+  if(any(is.na(data))){
+    data <- na.omit(data)
+    warning("Missing values found. All rows with NA's omitted.")
+  }
+  data
 }
 
-# fit model with first row to determine parameter number (for example right treatment of factor variables). Early exit for underdetermined models.
+# fit model to determine parameter number (for example right treatment of factor variables). Early exit for underdetermined models.
 get_number_parameters <- function(formula, data) {
-  parameter_number <- length(coefficients(lm(formula, data = data[1, , drop = FALSE])))
+  parameter_number <- length(
+    coefficients(
+      lm(formula, data = data)
+    )
+  )
   if (parameter_number > dim(data)[1]) {
     stop("Number of parameters < number of observations")
   }
@@ -133,10 +145,243 @@ add_consensus_column <- function(data, best_consensus_set) {
 }
 ```
 
+Parallelize over the iterations for loop -> future.apply package (replicate)
+
+```{r}
+# Iterative method to estimate parameters of a linear model from a set of observed data that may contain outliers. Moreover the so called consensus set (a robust training set without outliers) is determined and returned with the according trained model.
+# input:
+# * formula: formula for the lm fit
+# * data: original training data (rows with missing values will be omitted)
+# * error_threshold: Threshold value to determine data points that are fit well by model
+# * inlier_threshold: Number of close data points required to assert that a model fits well to data
+# * seed and iterations: optional seed and repetition arguments.
+# output: list of model and data (if successful data has a additional boolean column which indicates the consensus set)
+ransaclm_parallel <- function(formula, data, error_threshold, inlier_threshold, seed = 2, iterations = 100, workers = 1) {
+  # additional input check for additinal argument workers
+  checkmate::assert_count(workers, positive = TRUE)
+  data <- input_checks(formula, data, error_threshold, inlier_threshold, seed, iterations)
+  set.seed(seed)
+  parameter_number <- get_number_parameters(formula, data)
+  
+  # parallel:
+  future::plan("multiprocess", workers = workers)
+  results_list <- future.apply::future_replicate(iterations, {
+    find_robust_model(formula, data, error_threshold, inlier_threshold, parameter_number)
+  }, simplify = FALSE)
+  
+  error_vector <- unlist(lapply(results_list, function(list_element){
+    list_element[["error"]]
+  }))
+  
+  best_model_index <- which.min(error_vector)
+  best_model <- results_list[[best_model_index]][["model"]]
+  best_consensus_set <- results_list[[best_model_index]][["consensus_set"]]
+  
+  if (!is.null(best_model)) {
+    data <- add_consensus_column(data, best_consensus_set)
+  }
+  list(
+    "model" = best_model,
+    "data" = data
+  )
+}
+
+
+find_robust_model <- function(formula, data, error_threshold, inlier_threshold, parameter_number) {
+    # sample required starting training set without replacement (to estimate all parameters one needs at least as many observations as parameters)
+    hypothetical_inliers_ind <- sample(nrow(data), parameter_number)
+    current_model <- lm(formula, data[hypothetical_inliers_ind, ])
+    consensus_set <- list()
+    for (observation_ind in seq(dim(data)[1])[-hypothetical_inliers_ind]) {
+      distance <- get_distance(formula, data[observation_ind, , drop = FALSE], current_model)
+      if (distance < error_threshold) {
+        consensus_set <- append(consensus_set, observation_ind)
+      }
+    }
+    consensus_set <- as.vector(unlist(consensus_set))
+    if (length(consensus_set) > inlier_threshold) {
+      improved_model <- lm(formula, data = data[c(hypothetical_inliers_ind, consensus_set), ])
+      improved_model_error <- deviance(improved_model)
+      return(list(model = improved_model,
+                  error = improved_model_error,
+                  consensus_set = c(consensus_set, hypothetical_inliers_ind)))
+    }
+    # if no improved model is found return the following list
+    list(model = NULL,
+         error = Inf,
+         consensus_set = NULL)
+}
+
+```
 
 
 c) Überprüfen Sie Ihre Implementation (auch) mit dem untenstehenden Testcode auf Korrektheit, Ihre Funktion sollte (ungefähr, da stochastischer Algorithmus!) das selbe Ergebnis produzieren.  
 Überlegen Sie sich weitere Testfälle für Komplikationen, die bei der Anwendung auf echte Daten auftauchen könnten, und überprüfen Sie Ihre Funktion damit. Schreiben Sie dafür entsprechende Tests mit den in `testthat` und `checkmate` implementierten `expect_<BLA>()`-Funktionen.
+
+```{r}
+library(testthat)
+test_that("wrong input for ransaclm", {
+  #wrong formula
+  expect_error(ransaclm("mpg ~ .", mtcars,
+    error_threshold = 1, inlier_threshold = 2,
+    iterations = 2
+  ))
+  # all missing data frame
+  expect_error(ransaclm(a ~ ., data.frame(a = rep(NA,3),
+                                            b = rep(NA,3)),
+    error_threshold = 1, inlier_threshold = 2,
+    iterations = 2
+  ))
+  # wrong data input format
+  expect_error(ransaclm(mpg ~ ., as.matrix(mtcars),
+    error_threshold = 1, inlier_threshold = 2,
+    iterations = 2
+  ))
+  # illegal error_threshold
+  expect_error(ransaclm(mpg ~ ., mtcars,
+    error_threshold = -1.4, inlier_threshold = 2,
+    iterations = 2
+  ))
+  # illegal inlier_threshold
+  expect_error(ransaclm(mpg ~ ., mtcars,
+    error_threshold = 1, inlier_threshold = 2.1,
+    iterations = 2
+  ))
+  # illegal inlier_threshold
+  expect_error(ransaclm(mpg ~ ., mtcars,
+    error_threshold = 1, inlier_threshold = -2,
+    iterations = 2
+  ))
+  # illegal iterations
+  expect_error(ransaclm(mpg ~ ., mtcars,
+    error_threshold = 1, inlier_threshold = 20,
+    iterations = 2.5
+  ))
+  # illegal seed
+  expect_error(ransaclm(mpg ~ ., mtcars,
+    error_threshold = 1, inlier_threshold = 2,
+    seed = -pi,
+    iterations = 2
+  ))
+})
+
+test_that("proper output of ransaclm", {
+  # check output format (list)
+  expect_true(
+    checkmate::check_list(
+      ransaclm(mpg ~ ., mtcars,
+        error_threshold = 100, inlier_threshold = 20,
+        iterations = 3
+      )
+    )
+  )
+  # check output format (lm element of the list) only numeric df
+  expect_true(
+    checkmate::check_class(
+      ransaclm(mpg ~ ., mtcars,
+        error_threshold = 100, inlier_threshold = 20,
+        iterations = 3
+      )[["model"]], "lm"
+    )
+  )
+  # check output format (lm element of the list) df with factor vars
+  expect_true(
+    checkmate::check_class(
+      ransaclm(Sepal.Length ~ ., iris,
+        error_threshold = 100, inlier_threshold = 20,
+        iterations = 3
+      )[["model"]], "lm"
+    )
+  )
+  # check output format (data element of the list) only numeric df
+  expect_true(
+    checkmate::check_data_frame(
+      ransaclm(mpg ~ ., mtcars,
+        error_threshold = 100, inlier_threshold = 20,
+        iterations = 3
+      )[["data"]]
+    )
+  )
+  # check output format (data element of the list) df with factor vars
+  expect_true(
+    checkmate::check_data_frame(
+      ransaclm(Sepal.Length ~ ., iris,
+        error_threshold = 100, inlier_threshold = 20,
+        iterations = 3
+      )[["data"]]
+    )
+  )
+  # check output format model found (column number of data element of the list)
+  expect_equal(
+    ncol(ransaclm(mpg ~ ., mtcars,
+      error_threshold = 10000, inlier_threshold = 20,
+      iterations = 3
+    )[["data"]]),
+    ncol(mtcars) + 1
+  )
+  # check output format model null (column number of data element of the list)
+  expect_equal(
+    ncol(ransaclm(mpg ~ ., mtcars,
+      error_threshold = 0, inlier_threshold = 20,
+      iterations = 3
+    )[["data"]]),
+    ncol(mtcars)
+  )
+  # check null output for model element if the algorithm did not manage to find a suitable model
+  expect_null(
+    ransaclm(mpg ~ ., mtcars,
+      error_threshold = 0, inlier_threshold = 20,
+      iterations = 3
+    )[["model"]]
+  )
+})
+
+# simulate missing data
+mtcars_with_missing <- mtcars
+for (i in seq(dim(mtcars)[1])) {
+  for (j in seq(dim(mtcars)[2])) {
+    # roughly 5 percent missing
+    if(runif(1) < 0.05) {
+      mtcars_with_missing[i,j] <- NA
+    }
+  }
+}
+
+test_that("test critical inputs for ransaclm", {
+  # p > n
+  expect_error(
+    ransaclm(mpg ~ ., mtcars[1:5,],
+      error_threshold = 1110, inlier_threshold = 4,
+      iterations = 3
+    )
+  )
+  # NAs
+  expect_warning(
+    ransaclm(mpg ~ ., mtcars_with_missing,
+      error_threshold = 1110, inlier_threshold = 4,
+      iterations = 3
+    )
+  )
+  # tests as above but for NAs
+  expect_true(
+    checkmate::check_class(
+      ransaclm(mpg ~ ., mtcars_with_missing,
+      error_threshold = 1110, inlier_threshold = 4,
+      iterations = 3
+    )[["model"]], "lm"
+    )
+  )
+  expect_true(
+    checkmate::check_data_frame(
+      ransaclm(mpg ~ ., mtcars_with_missing,
+      error_threshold = 1110, inlier_threshold = 4,
+      iterations = 3
+    )[["data"]]
+    )
+  )
+})
+```
+
 
 **Wie immer gilt: Schreiben Sie sauber strukturierten, ausführlich kommentierten & funktionalen 
 Code ("KIS! DRY!"), der für erwartbare Fehler und ungeeignete Inputs informative Fehlermeldungen und Warnungen produziert.**
