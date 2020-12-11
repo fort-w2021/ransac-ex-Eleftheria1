@@ -7,7 +7,7 @@ ransac_simple <- ransaclm(y ~ . - inlier,
                                    data = data_simple, error_threshold = 2,
                                    inlier_threshold = 50, seed = 20171111
 )
-ransac_simple_parallel <- ransaclm_parallel(y ~ . - inlier,
+ransac_simple_parallel <- ransaclm(y ~ . - inlier,
                           data = data_simple, error_threshold = 2,
                           inlier_threshold = 50, seed = 20171111,
                           workers = 2

@@ -17,37 +17,31 @@ a) *First, understand the problem. Then, write the code.* Skizzieren Sie zunäch
 (Welches Paket -- `{future.apply}`, `{furrr}` `{foreach}` + `{do??}`, `{parallel}` -- Sie für die Parallelisierung benutzen bleibt Ihnen überlassen.)
 
 
-```{r}
-ransaclm <- function(formula, data, error_threshold, inlier_threshold, seed = 2, iterations = 100) {
-  input_checks(formula, data, error_threshold, inlier_threshold, seed, iterations)
-  p <- get_number_parameters(formula, data)
-  best_model <- NULL
-  best_error <- Inf
-  best_consensus_set <- NULL
-  for (i in 1:iterations) {
-    hypothetical_inliers_ind <- subsample(data, p)
-    current_model <- lm(formula, data[hypothetical_inliers_ind])
-    consensus_set <- list()
-    for (observation in data[-hypothetical_inliers_ind]) {
-      distance <- check_distance(observation, current_model)
-      if (distance < error_threshold) {
-        append(consensus_set, observation)
-      }
-    }
-    if (length(consensus_set) > inlier_threshold) {
-      improved_model <- lm(formula, data = hypothetical_inliers_ind + consensus_set)
-      improved_model_error <- get_error(improved_model)
-      if (improved_model_error < best_error) {
-        best_model <- improved_model
-        best_error <- improved_model_error
-        best_consensus_set <- consensus_set + hypothetical_inliers_ind
-      }
-    }
+```{r, eval=FALSE}
+# only pseudo
+ransaclm <- function(formula, data, error_threshold, inlier_threshold, seed, iterations, workers) {
+  data <- input_checks()
+  parameter_number <- get_number_parameters()
+  results_list <- replicate(iterations, {
+    find_robust_model()
+  }, simplify = FALSE)
+  
+  error_vector <- get_error_vector()
+  
+  if(no improved model){
+    return(list("model" = NULL,
+                "data" = data))
   }
-  if (!is.null(best_model)) {
-    data <- add_consensus_column(data, best_consensus_set)
-  }
-  list(model, data)
+
+  best_model_index <- which.min(error_vector)
+  best_consensus_set <- results_list[[best_model_index]]$consensus_set
+  best_model <- results_list[[best_model_index]]$model
+  data <- add_consensus_column(data, best_consensus_set)
+  
+  list(
+    "model" = best_model,
+    "data" = data
+  )
 }
 ```
 
@@ -63,39 +57,37 @@ b) Implementieren Sie Ihren Entwurf aus a).
 # * error_threshold: Threshold value to determine data points that are fit well by model
 # * inlier_threshold: Number of close data points required to assert that a model fits well to data
 # * seed and iterations: optional seed and repetition arguments.
+# * workers: if 1 sequential iterations and else number of workers to parallize
 # output: list of model and data (if successful data has a additional boolean column which indicates the consensus set)
-ransaclm <- function(formula, data, error_threshold, inlier_threshold, seed = 2, iterations = 100) {
-  data <- input_checks(formula, data, error_threshold, inlier_threshold, seed, iterations)
+ransaclm <- function(formula, data, error_threshold, inlier_threshold, seed = 2, iterations = 100, workers = 1) {
   set.seed(seed)
+  data <- input_checks(formula, data, error_threshold, inlier_threshold, seed, iterations, workers)
   parameter_number <- get_number_parameters(formula, data)
-  best_model <- NULL
-  best_error <- Inf
-  best_consensus_set <- NULL
-  for (i in 1:iterations) {
-    # sample required starting training set without replacement (to estimate all parameters one needs at least as many observations as parameters)
-    hypothetical_inliers_ind <- sample(nrow(data), parameter_number)
-    current_model <- lm(formula, data[hypothetical_inliers_ind, ])
-    consensus_set <- list()
-    for (observation_ind in seq(dim(data)[1])[-hypothetical_inliers_ind]) {
-      distance <- get_distance(formula, data[observation_ind, , drop = FALSE], current_model)
-      if (distance < error_threshold) {
-        consensus_set <- append(consensus_set, observation_ind)
-      }
-    }
-    consensus_set <- as.vector(unlist(consensus_set))
-    if (length(consensus_set) > inlier_threshold) {
-      improved_model <- lm(formula, data = data[c(hypothetical_inliers_ind, consensus_set), ])
-      improved_model_error <- deviance(improved_model)
-      if (improved_model_error < best_error) {
-        best_model <- improved_model
-        best_error <- improved_model_error
-        best_consensus_set <- c(consensus_set, hypothetical_inliers_ind)
-      }
-    }
+  # try to find robust model for every iteration
+    # parallel:
+    future::plan("multiprocess", workers = workers)
+    results_list <- future.apply::future_replicate(iterations,
+      {
+        find_robust_model(formula, data, error_threshold, inlier_threshold, parameter_number)
+      },
+      simplify = FALSE
+    )
+  error_vector <- unlist(lapply(results_list, function(list_element) {
+    list_element[["error"]]
+  }))
+  # early exit if no specified model found
+  if (all(error_vector == Inf)) {
+    return(list(
+      "model" = NULL,
+      "data" = data
+    ))
   }
-  if (!is.null(best_model)) {
-    data <- add_consensus_column(data, best_consensus_set)
-  }
+
+  best_model_index <- which.min(error_vector)
+  best_consensus_set <- results_list[[best_model_index]][["consensus_set"]]
+  best_model <- lm(formula, data[best_consensus_set, ])
+  data <- add_consensus_column(data, best_consensus_set)
+
   list(
     "model" = best_model,
     "data" = data
@@ -103,7 +95,9 @@ ransaclm <- function(formula, data, error_threshold, inlier_threshold, seed = 2,
 }
 
 # check the arguments (return data for missing values handling)
-input_checks <- function(formula, data, error_threshold, inlier_threshold, seed, iterations) {
+# output: list with error and consensus_set. if no model found error is Inf
+input_checks <- function(formula, data, error_threshold, inlier_threshold, seed, iterations, workers) {
+  checkmate::assert_count(workers, positive = TRUE)
   checkmate::assert_formula(formula)
   checkmate::assert_data_frame(data, min.rows = 1, min.cols = 2, all.missing = FALSE)
   checkmate::assert_numeric(error_threshold, lower = 0, len = 1, any.missing = FALSE, finite = TRUE)
@@ -111,7 +105,7 @@ input_checks <- function(formula, data, error_threshold, inlier_threshold, seed,
   checkmate::assert_count(seed)
   checkmate::assert_count(iterations, positive = TRUE)
   # deal with missing data
-  if(any(is.na(data))){
+  if (any(is.na(data))) {
     data <- na.omit(data)
     warning("Missing values found. All rows with NA's omitted.")
   }
@@ -131,6 +125,37 @@ get_number_parameters <- function(formula, data) {
   parameter_number
 }
 
+# try to find a robust model
+find_robust_model <- function(formula, data, error_threshold, inlier_threshold, parameter_number) {
+  # sample required starting training set without replacement (to estimate all parameters one needs at least as many observations as parameters)
+  hypothetical_inliers_ind <- sample(nrow(data), parameter_number)
+  current_model <- lm(formula, data[hypothetical_inliers_ind, ])
+  consensus_set <- list()
+  # determine inliers from observations that were not in the hypothetical inlier set 
+  for (observation_ind in seq(dim(data)[1])[-hypothetical_inliers_ind]) {
+    distance <- get_distance(formula, data[observation_ind, , drop = FALSE], current_model)
+    # add observation to consensus set if residual distance is small enough
+    if (distance < error_threshold) {
+      consensus_set <- append(consensus_set, observation_ind)
+    }
+  }
+  consensus_set <- as.vector(unlist(consensus_set))
+  # if consensut set is big enough fit model on new consensus set and compute model error
+  if (length(consensus_set) > inlier_threshold) {
+    improved_model <- lm(formula, data = data[c(hypothetical_inliers_ind, consensus_set), ])
+    improved_model_error <- deviance(improved_model)
+    return(list(
+      error = improved_model_error,
+      consensus_set = c(consensus_set, hypothetical_inliers_ind)
+    ))
+  }
+  # if no improved model is found return the following list
+  list(
+    error = Inf,
+    consensus_set = NULL
+  )
+}
+
 # get the distance for the current observation which corresponds to the residual wrt the current model
 get_distance <- function(formula, observation, current_model) {
   predicted_value <- predict.lm(current_model, observation)
@@ -143,74 +168,7 @@ add_consensus_column <- function(data, best_consensus_set) {
   in_consensus_set <- seq(dim(data)[1]) %in% best_consensus_set
   cbind(data, ".consensus_set" = in_consensus_set)
 }
-```
 
-Parallelize over the iterations for loop -> future.apply package (replicate)
-
-```{r}
-# Iterative method to estimate parameters of a linear model from a set of observed data that may contain outliers. Moreover the so called consensus set (a robust training set without outliers) is determined and returned with the according trained model.
-# input:
-# * formula: formula for the lm fit
-# * data: original training data (rows with missing values will be omitted)
-# * error_threshold: Threshold value to determine data points that are fit well by model
-# * inlier_threshold: Number of close data points required to assert that a model fits well to data
-# * seed and iterations: optional seed and repetition arguments.
-# output: list of model and data (if successful data has a additional boolean column which indicates the consensus set)
-ransaclm_parallel <- function(formula, data, error_threshold, inlier_threshold, seed = 2, iterations = 100, workers = 1) {
-  # additional input check for additinal argument workers
-  checkmate::assert_count(workers, positive = TRUE)
-  data <- input_checks(formula, data, error_threshold, inlier_threshold, seed, iterations)
-  set.seed(seed)
-  parameter_number <- get_number_parameters(formula, data)
-  
-  # parallel:
-  future::plan("multiprocess", workers = workers)
-  results_list <- future.apply::future_replicate(iterations, {
-    find_robust_model(formula, data, error_threshold, inlier_threshold, parameter_number)
-  }, simplify = FALSE)
-  
-  error_vector <- unlist(lapply(results_list, function(list_element){
-    list_element[["error"]]
-  }))
-  
-  best_model_index <- which.min(error_vector)
-  best_model <- results_list[[best_model_index]][["model"]]
-  best_consensus_set <- results_list[[best_model_index]][["consensus_set"]]
-  
-  if (!is.null(best_model)) {
-    data <- add_consensus_column(data, best_consensus_set)
-  }
-  list(
-    "model" = best_model,
-    "data" = data
-  )
-}
-
-
-find_robust_model <- function(formula, data, error_threshold, inlier_threshold, parameter_number) {
-    # sample required starting training set without replacement (to estimate all parameters one needs at least as many observations as parameters)
-    hypothetical_inliers_ind <- sample(nrow(data), parameter_number)
-    current_model <- lm(formula, data[hypothetical_inliers_ind, ])
-    consensus_set <- list()
-    for (observation_ind in seq(dim(data)[1])[-hypothetical_inliers_ind]) {
-      distance <- get_distance(formula, data[observation_ind, , drop = FALSE], current_model)
-      if (distance < error_threshold) {
-        consensus_set <- append(consensus_set, observation_ind)
-      }
-    }
-    consensus_set <- as.vector(unlist(consensus_set))
-    if (length(consensus_set) > inlier_threshold) {
-      improved_model <- lm(formula, data = data[c(hypothetical_inliers_ind, consensus_set), ])
-      improved_model_error <- deviance(improved_model)
-      return(list(model = improved_model,
-                  error = improved_model_error,
-                  consensus_set = c(consensus_set, hypothetical_inliers_ind)))
-    }
-    # if no improved model is found return the following list
-    list(model = NULL,
-         error = Inf,
-         consensus_set = NULL)
-}
 
 ```
 
@@ -380,6 +338,22 @@ test_that("test critical inputs for ransaclm", {
     )
   )
 })
+```
+
+
+```{r}
+bench::mark(
+  ransaclm(y ~ . - inlier,
+                                   data = data_simple, error_threshold = 2,
+                                   inlier_threshold = 50, seed = 20171111,
+           workers = 1
+),
+ransaclm(y ~ . - inlier,
+                          data = data_simple, error_threshold = 2,
+                          inlier_threshold = 50, seed = 20171111,
+                          workers = 2
+)
+)
 ```
 
 
