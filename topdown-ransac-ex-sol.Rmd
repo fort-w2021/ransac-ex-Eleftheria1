@@ -341,7 +341,7 @@ test_that("test critical inputs for ransaclm", {
 ```
 
 
-```{r}
+```{r, eval = FALSE}
 bench::mark(
   ransaclm(y ~ . - inlier,
                                    data = data_simple, error_threshold = 2,
